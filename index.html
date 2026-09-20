@@ -1142,7 +1142,8 @@
       <div id="tab-sum" class="tab-pane">
         <div class="chart-card">
           <h3>White Ball Sum Distribution</h3>
-          <p class="chart-desc">Distribution of the sum of 5 white balls per draw. The bell-curve center represents the statistically most common range.</p>
+          <p class="chart-desc">Distribution of the sum of 5 white balls per draw, plotted from 80 upward. The bell-curve center represents the statistically most common range.</p>
+          <p class="chart-desc" id="sum-chart-note"></p>
           <div class="chart-wrap" style="height:340px;">
             <canvas id="chartSum"></canvas>
           </div>
@@ -2911,16 +2912,46 @@ function renderFreqBars(wFreq, rFreq, total) {
   });
 }
 
+/* The plotted floor for the sum distribution. Sums below it are a thin tail —
+   a handful of draws spread across a wide span — and plotting them squeezes the
+   readable part of the curve. Only the CHART is floored: every other statistic
+   in the app, including the generator's sum window, still counts every draw. */
+const SUM_CHART_FLOOR = 80;
+
+/* Buckets sums into contiguous 10-wide bands from the floor upward. Pure, so
+   the shape can be tested without a canvas. Empty bands inside the range are
+   kept at zero so the axis never jumps a gap. */
+function buildSumChartBuckets(sums, floor = SUM_CHART_FLOOR, width = 10) {
+  const total = sums.length;
+  const shown = sums.filter(s => s >= floor);
+  if (!shown.length) return { keys: [], vals: [], shown: 0, hidden: total, total, floor, width };
+
+  const counts = {};
+  let max = -Infinity;
+  for (const s of shown) {
+    const b = Math.floor(s / width) * width;
+    counts[b] = (counts[b] || 0) + 1;
+    if (b > max) max = b;
+  }
+
+  const keys = [], vals = [];
+  for (let b = Math.floor(floor / width) * width; b <= max; b += width) {
+    keys.push(b);
+    vals.push(counts[b] || 0);
+  }
+  return { keys, vals, shown: shown.length, hidden: total - shown.length, total, floor, width };
+}
+
 function renderSumChart(sums) {
   if (charts.sum) charts.sum.destroy();
-  // Bucket into ranges of 10
-  const buckets = {};
-  sums.forEach(s => {
-    const b = Math.floor(s/10)*10;
-    buckets[b] = (buckets[b]||0) + 1;
-  });
-  const keys = Object.keys(buckets).map(Number).sort((a,b)=>a-b);
-  const vals = keys.map(k => buckets[k]);
+  const { keys, vals, shown, hidden, total } = buildSumChartBuckets(sums);
+
+  const note = document.getElementById('sum-chart-note');
+  if (note) {
+    note.textContent = hidden
+      ? `Plotted from ${SUM_CHART_FLOOR} up: ${shown.toLocaleString()} of ${total.toLocaleString()} draws. ${hidden} drawing${hidden === 1 ? '' : 's'} fell below ${SUM_CHART_FLOOR} (${(hidden / total * 100).toFixed(1)}%) and sit outside this view — they are still counted everywhere else in the app.`
+      : `Plotted from ${SUM_CHART_FLOOR} up — every one of the ${total.toLocaleString()} draws falls inside this range.`;
+  }
 
   charts.sum = new Chart(document.getElementById('chartSum'), {
     type: 'bar',
@@ -2939,7 +2970,7 @@ function renderSumChart(sums) {
     },
     options: {
       responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.raw} draws (${(ctx.raw/sums.length*100).toFixed(1)}%)` } } },
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.raw} draws (${(ctx.raw/sums.length*100).toFixed(1)}% of all drawings)` } } },
       scales: {
         x: { ticks: { color: '#6b6a65', font: { size: 10 }, maxRotation: 45 }, grid: { display: false } },
         y: { ticks: { color: '#6b6a65', font: { size: 10 } }, grid: { color: 'rgba(0,0,0,0.05)' } }
@@ -5167,6 +5198,45 @@ function runSelfTests() {
     return alt.sumRange.lo !== gm.sumRange.lo ? true
       : `both windows start at ${gm.sumRange.lo}`;
   });
+  /* — sum distribution chart window — */
+  check('sum chart: nothing below the floor is plotted', () => {
+    const b = buildSumChartBuckets(RAW_DRAWS.map(d => computeDrawMetrics(d).sum));
+    if (b.keys.some(k => k < SUM_CHART_FLOOR)) return `bucket ${Math.min(...b.keys)} below ${SUM_CHART_FLOOR}`;
+    return eq(b.keys[0], SUM_CHART_FLOOR, 'first bucket');
+  });
+  check('sum chart: the excluded tail is counted, not silently dropped', () => {
+    const sums = RAW_DRAWS.map(d => computeDrawMetrics(d).sum);
+    const b = buildSumChartBuckets(sums);
+    const below = sums.filter(s => s < SUM_CHART_FLOOR).length;
+    if (b.hidden !== below) return `hidden ${b.hidden}, actual ${below}`;
+    return eq(b.shown + b.hidden, sums.length, 'plotted + hidden');
+  });
+  check('sum chart: every plotted draw lands in exactly one bucket', () => {
+    const b = buildSumChartBuckets(RAW_DRAWS.map(d => computeDrawMetrics(d).sum));
+    return eq(b.vals.reduce((a, v) => a + v, 0), b.shown, 'bucket total');
+  });
+  check('sum chart: bands are contiguous, gaps kept at zero', () => {
+    const b = buildSumChartBuckets([80, 85, 300]);
+    const want = [];
+    for (let k = 80; k <= 300; k += 10) want.push(k);
+    if (JSON.stringify(b.keys) !== JSON.stringify(want)) return `got ${b.keys.length} bands`;
+    return b.vals[0] === 2 && b.vals[b.vals.length - 1] === 1 && b.vals[5] === 0
+      ? true : `edges ${b.vals[0]}/${b.vals[b.vals.length - 1]}`;
+  });
+  check('sum chart: the floor is inclusive', () => {
+    const b = buildSumChartBuckets([79, 80]);
+    return b.hidden === 1 && b.shown === 1 && b.vals[0] === 1 ? true : `hidden ${b.hidden} shown ${b.shown}`;
+  });
+  check('sum chart: an all-below-floor dataset returns an empty, honest shape', () => {
+    const b = buildSumChartBuckets([60, 70]);
+    return b.keys.length === 0 && b.hidden === 2 && b.shown === 0 ? true : `got ${JSON.stringify(b.keys)}`;
+  });
+  check('sum chart: the floor does not touch the generator sum window', () => {
+    // The generator still measures every draw, low tail included.
+    const gm2 = buildGeneratorModel(RAW_DRAWS);
+    return eq(`${gm2.sumRange.lo}–${gm2.sumRange.hi}`, getMostCommonSumRange(RAW_DRAWS), 'sum window');
+  });
+
   check('constraint: sum range matches the sum-distribution helper', () => {
     const asText = `${gm.sumRange.lo}–${gm.sumRange.hi}`;
     return eq(getMostCommonSumRange(RAW_DRAWS), asText, 'sum range');
