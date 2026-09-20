@@ -3709,19 +3709,26 @@ const DRAW_MODES = [
    shape of the draw should never require touching the algorithm below.
    counts and pools are parallel arrays: tier i draws counts[i] balls from the
    top pools[i] most frequent white balls. Pools are cumulative slices of one
-   ranking, so tier 2's pool contains tier 1's. */
+   ranking, so tier 2's pool contains tier 1's.
+
+   BASELINE_POOL is not a fixed size: it resolves at runtime to however many
+   numbers have been drawn MORE often than pure chance would predict, so the
+   band widens or narrows with the dataset instead of being pinned to a rank. */
+const BASELINE_POOL = 'baseline';
+
 const TIER_CONFIG = {
-  powerballPool: 10,
-  counts: [2, 1, 1, 1],
-  pools:  [10, 23, 46, WHITE_MAX],
+  powerballPool: BASELINE_POOL,
+  counts: [1, 2, 2],
+  pools:  [10, BASELINE_POOL, WHITE_MAX],
   maxAttempts: 300,
   sumRelaxWidth: 20
 };
 
 /* Ranks 1..size by frequency descending, then by number ascending.
-   The explicit number tie-break matters: frequency ties straddle the rank-23
-   and rank-46 cutoffs in real data, so without it tier membership would depend
-   on engine sort behaviour. */
+   The explicit number tie-break matters wherever a pool is cut at a rank (the
+   top-10 band): frequency ties straddle that cutoff in real data, so without it
+   tier membership would depend on engine sort behaviour. A baseline pool is cut
+   on the frequency VALUE instead, so it can never split a tie. */
 function rankByFrequency(freq, size) {
   const entries = [];
   for (let n = 1; n <= size; n++) entries.push([n, freq[n] || 0]);
@@ -3732,6 +3739,42 @@ function rankByFrequency(freq, size) {
 /* Cumulative top-N slice of a ranking, clamped to the ranking's length. */
 function topSlice(ranked, n) {
   return ranked.slice(0, Math.max(0, Math.min(n, ranked.length)));
+}
+
+/* Appearances a single number would expect if every drawing were uniform:
+   draws × balls-per-draw ÷ pool size. For the white balls that is n×5/69, for
+   the Powerball n×1/26. This is the "expected random baseline". */
+function expectedBaseline(totalDraws, picks, size) {
+  return size > 0 ? (totalDraws * picks) / size : 0;
+}
+
+/* How many numbers sit strictly above that baseline. Cutting on the frequency
+   value rather than a rank position means equal-frequency numbers are always on
+   the same side of the line — the pool can never split a tie. With no data the
+   whole field counts as the pool, so generation still works. */
+function countAboveBaseline(freq, size, totalDraws, picks) {
+  if (!totalDraws) return size;
+  const baseline = expectedBaseline(totalDraws, picks, size);
+  let c = 0;
+  for (let n = 1; n <= size; n++) if ((freq[n] || 0) > baseline) c++;
+  return c;
+}
+
+/* Resolves the symbolic pool list into concrete sizes against the live data.
+   BASELINE_POOL becomes the above-baseline count; every size is then clamped so
+   the pools stay ascending and each one holds enough numbers to fill its own
+   tier plus every tier before it. */
+function resolveTierSizes(pools, counts, baselineCount, size) {
+  const sizes = [];
+  let needed = 0, prev = 0;
+  for (let i = 0; i < pools.length; i++) {
+    needed += counts[i];
+    const raw = pools[i] === BASELINE_POOL ? baselineCount : pools[i];
+    const v = Math.min(size, Math.max(raw, needed, prev));
+    sizes.push(v);
+    prev = v;
+  }
+  return sizes;
 }
 
 /* Picks one number from an explicit pool, honouring mode weights and skipping
@@ -3880,8 +3923,23 @@ function buildGeneratorModel(draws) {
   const rankedWhites = rankByFrequency(wFreq, WHITE_MAX);
   const rankedPowerballs = rankByFrequency(rFreq, POWERBALL_MAX);
 
-  const tierPools = TIER_CONFIG.pools.map(n => topSlice(rankedWhites, n));
-  const powerballPool = topSlice(rankedPowerballs, TIER_CONFIG.powerballPool);
+  // Above-baseline pools, sized from the data rather than from a fixed rank.
+  const whiteBaseline = {
+    expected: expectedBaseline(draws.length, WHITE_PICKS, WHITE_MAX),
+    count: countAboveBaseline(wFreq, WHITE_MAX, draws.length, WHITE_PICKS)
+  };
+  const powerballBaseline = {
+    expected: expectedBaseline(draws.length, 1, POWERBALL_MAX),
+    count: countAboveBaseline(rFreq, POWERBALL_MAX, draws.length, 1)
+  };
+
+  const tierSizes = resolveTierSizes(TIER_CONFIG.pools, TIER_CONFIG.counts, whiteBaseline.count, WHITE_MAX);
+  const tierPools = tierSizes.map(n => topSlice(rankedWhites, n));
+
+  const powerballPoolSize = TIER_CONFIG.powerballPool === BASELINE_POOL
+    ? Math.min(POWERBALL_MAX, Math.max(powerballBaseline.count, 1))
+    : Math.min(POWERBALL_MAX, TIER_CONFIG.powerballPool);
+  const powerballPool = topSlice(rankedPowerballs, powerballPoolSize);
 
   const parityTargets = {};
   for (let pb = 1; pb <= POWERBALL_MAX; pb++) {
@@ -3898,7 +3956,8 @@ function buildGeneratorModel(draws) {
     wFreq, rFreq, sums, historicalWhites,
     totalDraws: draws.length,
     rankedWhites, rankedPowerballs,
-    tierPools, powerballPool,
+    tierPools, tierSizes, powerballPool, powerballPoolSize,
+    whiteBaseline, powerballBaseline,
     parityByPowerball, parityTargets,
     sumRange,
     parityPcts: parityCounts.map(c => (c / total) * 100),
@@ -3944,8 +4003,10 @@ function drawTieredWhites(model, weights, rng) {
 
 /* Builds one ticket under the tiered rules.
 
-   1. Powerball is drawn from the top-N most frequent Powerball numbers.
-   2. White balls are drawn through the frequency tiers.
+   1. Powerball is drawn from the red balls above the expected random baseline.
+   2. White balls are drawn through the frequency tiers: 1 from the top 10,
+      2 from the numbers above the expected random baseline, 2 from whatever is
+      left in the field. No number can repeat inside a ticket.
    3. Parity must match the dominant white-ball pattern for that Powerball.
    4. Sum must fall inside the most common white-ball sum bucket.
 
@@ -4358,15 +4419,26 @@ function setDrawMode(id) {
     `Weighting set to ${m.label} — ${m.blurb}. Press Draw to generate 10 combinations.`;
 }
 
+/* Names one white-ball band in plain language, using the size the live dataset
+   resolved it to. Keeps the rule strip and the per-ball tooltips in step. */
+function tierBandLabel(model, i) {
+  const spec = TIER_CONFIG.pools[i];
+  const size = model.tierSizes[i];
+  if (spec === WHITE_MAX || size >= WHITE_MAX) return 'any remaining number';
+  if (spec === BASELINE_POOL) return `above baseline (top ${size})`;
+  return `top ${size}`;
+}
+
 /* States the active rules, all derived from the live dataset. */
 function renderDrawConstraints() {
   const el = document.getElementById('draw-constraints');
   if (!generatorModel) { el.innerHTML = ''; return; }
   const m = generatorModel;
-  const pools = TIER_CONFIG.pools.map((n, i) => `${TIER_CONFIG.counts[i]}\u00d7 top ${n === WHITE_MAX ? 'any remaining' : n}`);
+  const pools = TIER_CONFIG.counts.map((c, i) => `${c}\u00d7 ${tierBandLabel(m, i)}`);
+  const pbExp = m.powerballBaseline.expected;
   el.innerHTML = `
-    <span class="dc-rule">Powerball drawn from the <strong>top ${TIER_CONFIG.powerballPool}</strong> most frequent red balls.</span>
-    <span class="dc-rule">White balls by frequency band: <strong>${pools.join(' · ')}</strong>.</span>
+    <span class="dc-rule">Powerball drawn from the <strong>${m.powerballPoolSize} red balls above the expected random baseline</strong> (more than ${pbExp.toFixed(1)} appearances in ${m.totalDraws.toLocaleString()} draws).</span>
+    <span class="dc-rule">White balls by frequency band: <strong>${pools.join(' · ')}</strong> — baseline is ${m.whiteBaseline.expected.toFixed(1)} appearances, cleared by ${m.whiteBaseline.count} numbers.</span>
     <span class="dc-rule">Odd/even split matched to the drawn Powerball's dominant pattern; white-ball sum inside <strong>${m.sumRange.lo}–${m.sumRange.hi}</strong>${m.sumRange.share ? ` (${m.sumRange.share.toFixed(1)}% of draws)` : ''}.</span>`;
 }
 
@@ -4392,11 +4464,11 @@ function renderTickets(tickets) {
       <div class="ticket-balls" aria-hidden="true">
         ${t.whites.map(n => {
           const tier = t.tierOf ? t.tierOf[n] : undefined;
-          const poolName = tier === undefined ? '' : (TIER_CONFIG.pools[tier] === WHITE_MAX ? 'any remaining number' : `top ${TIER_CONFIG.pools[tier]} band`);
+          const poolName = tier === undefined ? '' : tierBandLabel(generatorModel, tier);
           return `<div class="ticket-ball white" title="${n} — ${poolName}">${n}</div>`;
         }).join('')}
         <div class="ticket-sep">+</div>
-        <div class="ticket-ball red" title="Powerball ${t.powerball} — top ${TIER_CONFIG.powerballPool} band">${t.powerball}</div>
+        <div class="ticket-ball red" title="Powerball ${t.powerball} — above the expected random baseline">${t.powerball}</div>
       </div>
       <div class="ticket-meta">
         <span class="ticket-tag">Sum ${t.metrics.sum}</span>
@@ -4432,9 +4504,10 @@ function renderDrawSummary(tickets) {
           Built from <strong>${generatorModel.totalDraws.toLocaleString()}</strong> historical drawings using
           <strong>${mode.label}</strong> weighting inside each frequency band.
           <strong>${inRange} of ${tickets.length}</strong> tickets met every rule —
-          Powerball from the top ${TIER_CONFIG.powerballPool}, white balls through the
-          ${TIER_CONFIG.pools.slice(0, -1).join('/')} bands, parity matched to the drawn Powerball,
-          and a sum inside <strong>${r.lo}–${r.hi}</strong>.
+          Powerball from the ${generatorModel.powerballPoolSize} red balls running above the expected
+          random baseline, one white ball from the top ${generatorModel.tierSizes[0]}, two from the
+          ${generatorModel.whiteBaseline.count} whites above baseline, two from the rest of the field,
+          parity matched to the drawn Powerball, and a sum inside <strong>${r.lo}–${r.hi}</strong>.
           ${relaxed ? `${relaxed} needed a relaxed constraint and ${relaxed === 1 ? 'is' : 'are'} tagged as such. ` : ''}
           ${fallbacks ? `${fallbacks} used the parity fallback because that Powerball's dominant pattern was not 2/3 or 3/2. ` : ''}
           Batch average sum is <strong>${avgSum.toFixed(1)}</strong>.
@@ -4931,13 +5004,50 @@ function runSelfTests() {
   });
 
   /* — tiered selection: ranking and pools — */
-  check('ranking: tier pools are the configured sizes', () => {
+  check('ranking: tier pools match the resolved sizes', () => {
     const sizes = gm.tierPools.map(p => p.length);
-    const want = TIER_CONFIG.pools.map(n => Math.min(n, WHITE_MAX));
-    return JSON.stringify(sizes) === JSON.stringify(want) ? true : `got ${sizes}`;
+    return JSON.stringify(sizes) === JSON.stringify(gm.tierSizes) ? true : `got ${sizes} want ${gm.tierSizes}`;
   });
-  check('ranking: Powerball pool is the top 10', () =>
-    eq(gm.powerballPool.length, TIER_CONFIG.powerballPool, 'powerball pool size'));
+  check('baseline: the white band holds exactly the above-baseline numbers', () => {
+    const exp = gm.whiteBaseline.expected;
+    const pool = new Set(gm.tierPools[1]);
+    for (let n = 1; n <= WHITE_MAX; n++) {
+      const above = gm.wFreq[n] > exp;
+      if (above !== pool.has(n)) return `${n} freq ${gm.wFreq[n]} vs baseline ${exp.toFixed(2)}`;
+    }
+    return true;
+  });
+  check('baseline: white expectation is draws × 5 ÷ 69', () =>
+    eq(gm.whiteBaseline.expected.toFixed(4), ((RAW_DRAWS.length * 5) / 69).toFixed(4), 'white baseline'));
+  check('baseline: Powerball expectation is draws ÷ 26', () =>
+    eq(gm.powerballBaseline.expected.toFixed(4), (RAW_DRAWS.length / 26).toFixed(4), 'red baseline'));
+  check('baseline: the band is a real subset — some numbers fall below it', () =>
+    gm.whiteBaseline.count > 0 && gm.whiteBaseline.count < WHITE_MAX
+      ? true : `count ${gm.whiteBaseline.count}`);
+  check('baseline: cutting on frequency value never splits a tie', () => {
+    const pool = new Set(gm.tierPools[1]);
+    for (let a = 1; a <= WHITE_MAX; a++) {
+      for (let b = a + 1; b <= WHITE_MAX; b++) {
+        if (gm.wFreq[a] === gm.wFreq[b] && pool.has(a) !== pool.has(b)) return `${a}/${b} split at ${gm.wFreq[a]}`;
+      }
+    }
+    return true;
+  });
+  check('baseline: a skewed fixture moves the band size', () => {
+    const flat = [];
+    for (let i = 0; i < 60; i++) flat.push(['Sat Jan 3 2026', 1, 2, 3, 4, 5, 1, 2, '$1M']);
+    const alt = buildGeneratorModel(flat);
+    // Only five whites ever appear, so only those five clear the baseline.
+    return eq(alt.whiteBaseline.count, 5, 'above-baseline count');
+  });
+  check('ranking: Powerball pool is the above-baseline red balls', () => {
+    const exp = gm.powerballBaseline.expected;
+    const pool = new Set(gm.powerballPool);
+    for (let n = 1; n <= POWERBALL_MAX; n++) {
+      if ((gm.rFreq[n] > exp) !== pool.has(n)) return `PB ${n} freq ${gm.rFreq[n]} vs ${exp.toFixed(2)}`;
+    }
+    return eq(gm.powerballPool.length, gm.powerballPoolSize, 'powerball pool size');
+  });
   check('ranking: pools are cumulative subsets', () => {
     for (let i = 1; i < gm.tierPools.length; i++) {
       const outer = new Set(gm.tierPools[i]);
@@ -4957,8 +5067,8 @@ function runSelfTests() {
     return JSON.stringify(ranked.slice(0, 4)) === JSON.stringify([3, 9, 22, 40])
       ? true : `got ${ranked.slice(0, 4)}`;
   });
-  check('ranking: real cutoffs contain ties, and slicing stays stable', () => {
-    // Ranks 23/24 and 46/47 share frequencies in the live data.
+  check('ranking: pool membership is reproducible across rebuilds', () => {
+    // Rank 10/11 shares a frequency in the live data, so the tie-break matters.
     const a = buildGeneratorModel(RAW_DRAWS).tierPools.map(p => p.join(','));
     const b = buildGeneratorModel(RAW_DRAWS).tierPools.map(p => p.join(','));
     return a.join('|') === b.join('|') ? true : 'pool membership not reproducible';
@@ -4967,12 +5077,12 @@ function runSelfTests() {
   /* — tiered selection: the drawn numbers obey the bands — */
   const tieredBatch = generateTickets(gm, 60, 'weighted', seeded());
 
-  check('tiers: Powerball always comes from the top 10', () => {
+  check('tiers: Powerball always comes from the above-baseline pool', () => {
     const pool = new Set(gm.powerballPool);
     for (const t of tieredBatch) if (!pool.has(t.powerball)) return `PB ${t.powerball} outside pool`;
     return true;
   });
-  check('tiers: each ticket fills the configured 2/1/1/1 shape', () => {
+  check('tiers: each ticket fills the configured 1/2/2 shape', () => {
     for (const t of tieredBatch) {
       const counts = new Array(TIER_CONFIG.counts.length).fill(0);
       for (const n of t.whites) counts[t.tierOf[n]]++;
@@ -4980,42 +5090,48 @@ function runSelfTests() {
     }
     return true;
   });
-  check('tiers: the first two balls come from the top 10 band', () => {
+  check('tiers: exactly one ball comes from the top 10 band', () => {
     const pool = new Set(gm.tierPools[0]);
     for (const t of tieredBatch) {
       const tier0 = t.whites.filter(n => t.tierOf[n] === 0);
-      if (tier0.length !== 2) return `${tier0.length} balls in tier 0`;
-      if (tier0.some(n => !pool.has(n))) return `${tier0} outside top 10`;
+      if (tier0.length !== 1) return `${tier0.length} balls in tier 0`;
+      if (!pool.has(tier0[0])) return `${tier0[0]} outside the top ${gm.tierSizes[0]}`;
     }
     return true;
   });
-  check('tiers: the third ball comes from the top 23 band', () => {
+  check('tiers: two balls come from the above-baseline band', () => {
     const pool = new Set(gm.tierPools[1]);
+    const exp = gm.whiteBaseline.expected;
     for (const t of tieredBatch) {
       const b = t.whites.filter(n => t.tierOf[n] === 1);
-      if (b.length !== 1 || !pool.has(b[0])) return `${b} outside top 23`;
+      if (b.length !== 2) return `${b.length} balls in tier 1`;
+      for (const n of b) {
+        if (!pool.has(n)) return `${n} outside the baseline band`;
+        if (gm.wFreq[n] <= exp) return `${n} at ${gm.wFreq[n]} is not above ${exp.toFixed(2)}`;
+      }
     }
     return true;
   });
-  check('tiers: the fourth ball comes from the top 46 band', () => {
-    const pool = new Set(gm.tierPools[2]);
-    for (const t of tieredBatch) {
-      const b = t.whites.filter(n => t.tierOf[n] === 2);
-      if (b.length !== 1 || !pool.has(b[0])) return `${b} outside top 46`;
-    }
-    return true;
-  });
-  check('tiers: the final ball is unrestricted (some fall outside the top 46)', () => {
-    const top46 = new Set(gm.tierPools[2]);
+  check('tiers: the last two balls draw from the whole remaining field', () => {
+    const baseline = new Set(gm.tierPools[1]);
     let outside = 0;
     for (const t of tieredBatch) {
-      const b = t.whites.filter(n => t.tierOf[n] === 3)[0];
-      if (!top46.has(b)) outside++;
+      const b = t.whites.filter(n => t.tierOf[n] === 2);
+      if (b.length !== 2) return `${b.length} balls in tier 2`;
+      for (const n of b) if (!baseline.has(n)) outside++;
     }
-    return outside > 0 ? true : 'final ball never left the top 46';
+    return outside > 0 ? true : 'the final pair never left the baseline band';
   });
-  check('tiers: no ball is reused across bands', () => {
+  check('tiers: no ball is reused inside a ticket', () => {
     for (const t of tieredBatch) if (new Set(t.whites).size !== 5) return `duplicate in ${t.whites}`;
+    return true;
+  });
+  check('tiers: at least three balls always clear the baseline', () => {
+    const exp = gm.whiteBaseline.expected;
+    for (const t of tieredBatch) {
+      const hot = t.whites.filter(n => gm.wFreq[n] > exp).length;
+      if (hot < 3) return `only ${hot} above baseline in ${t.whites}`;
+    }
     return true;
   });
 
@@ -5095,14 +5211,32 @@ function runSelfTests() {
     eq(TIER_CONFIG.counts.reduce((a, b) => a + b, 0), WHITE_PICKS, 'white ball total'));
   check('config: counts and pools are parallel arrays', () =>
     eq(TIER_CONFIG.counts.length, TIER_CONFIG.pools.length, 'array lengths'));
-  check('config: pool sizes increase monotonically', () => {
-    for (let i = 1; i < TIER_CONFIG.pools.length; i++) {
-      if (TIER_CONFIG.pools[i] < TIER_CONFIG.pools[i - 1]) return 'pools not ascending';
+  check('config: resolved pool sizes increase monotonically', () => {
+    for (let i = 1; i < gm.tierSizes.length; i++) {
+      if (gm.tierSizes[i] < gm.tierSizes[i - 1]) return `not ascending: ${gm.tierSizes}`;
+    }
+    return true;
+  });
+  check('config: every tier is wide enough for the balls it owes', () => {
+    let need = 0;
+    for (let i = 0; i < gm.tierSizes.length; i++) {
+      need += TIER_CONFIG.counts[i];
+      if (gm.tierSizes[i] < need) return `tier ${i} holds ${gm.tierSizes[i]} for ${need} balls`;
     }
     return true;
   });
   check('config: the final tier spans all 69 numbers', () =>
     eq(TIER_CONFIG.pools[TIER_CONFIG.pools.length - 1], WHITE_MAX, 'final pool'));
+  check('config: a degenerate baseline still resolves to a usable ladder', () => {
+    // baselineCount of 0 must still leave every tier large enough to fill.
+    const sizes = resolveTierSizes(TIER_CONFIG.pools, TIER_CONFIG.counts, 0, WHITE_MAX);
+    let need = 0;
+    for (let i = 0; i < sizes.length; i++) {
+      need += TIER_CONFIG.counts[i];
+      if (sizes[i] < need || (i && sizes[i] < sizes[i - 1])) return `got ${sizes}`;
+    }
+    return true;
+  });
 
   /* — draw UI state — */
   check('draw: mode switch updates the radio group', () => {
